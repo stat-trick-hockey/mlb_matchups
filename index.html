@@ -444,12 +444,10 @@
 
 <div class="controls">
   <input type="date" class="date-input" id="date-picker" />
-  <select class="date-input" id="proxy-select" title="CORS Proxy">
-    <option value="corsproxy">Proxy: corsproxy.io</option>
-    <option value="allorigins">Proxy: allorigins</option>
-    <option value="direct">Direct (local only)</option>
-  </select>
   <button class="btn btn-primary" onclick="loadMatchups()">▶ LOAD MATCHUPS</button>
+</div>
+<div id="data-mode-banner" style="text-align:center;font-size:11px;letter-spacing:1.5px;font-weight:700;padding:4px 0 0;color:#4a8c3f;display:none">
+  ⚡ INSTANT MODE — PRE-FETCHED DATA ACTIVE
 </div>
 
 <div class="status-bar" id="status-bar">Select a date and load matchups.</div>
@@ -459,396 +457,393 @@
 <footer>Data: MLB Stats API &nbsp;·&nbsp; Scoring: OPS, ERA, K%, wOBA proxy, handedness &nbsp;·&nbsp; For entertainment purposes</footer>
 
 <script>
+/* ═══════════════════════════════════════════════════════════
+   MLB MATCHUP RANKER
+   • If MLB_DATA blob is present (injected by fetch_mlb_data.py)
+     → instant, zero-network mode for dates 2023–2025
+   • Otherwise falls back to live MLB Stats API via CORS proxy
+   ═══════════════════════════════════════════════════════════ */
+
+/* __MLB_DATA_START__ */
+// MLB_DATA will be injected here by fetch_mlb_data.py
+// Run: python fetch_mlb_data.py --inject mlb-matchups.html
+/* __MLB_DATA_END__ */
+
+const HAS_BLOB = typeof MLB_DATA !== 'undefined';
+
 /* ── UTILITIES ──────────────────────────────────────── */
 const $ = id => document.getElementById(id);
 const today = () => new Date().toISOString().slice(0,10);
 const fmt = d => new Date(d + 'T12:00:00').toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'});
 const clamp = (v,mn,mx) => Math.min(mx, Math.max(mn, v));
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-/* colour ramp: rust → gold */
 function scoreColor(pct) {
   const r = [192, 56, 43], g = [212, 160, 23];
   const t = pct / 100;
-  const mix = r.map((c,i) => Math.round(c + t*(g[i]-c)));
-  return `rgb(${mix.join(',')})`;
+  return `rgb(${r.map((c,i) => Math.round(c + t*(g[i]-c))).join(',')})`;
 }
 
-/* ── API HELPERS ────────────────────────────────────── */
-// CORS proxy — needed for GitHub Pages (browser can't hit statsapi.mlb.com directly).
-// Options:
-//   'corsproxy'  → https://corsproxy.io  (free, no setup)
-//   'allorigins' → https://api.allorigins.win (free, no setup, slightly slower)
-//   'custom'     → set CUSTOM_PROXY below to your own Cloudflare Worker URL
-const PROXY_MODE = 'corsproxy';
-const CUSTOM_PROXY = ''; // e.g. 'https://my-worker.example.workers.dev/?url='
-
-function proxyURL(url) {
-  const mode = document.getElementById('proxy-select')?.value || PROXY_MODE;
-  if (mode === 'corsproxy')  return `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
-  if (mode === 'allorigins') return `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-  if (mode === 'custom' && CUSTOM_PROXY) return CUSTOM_PROXY + encodeURIComponent(url);
-  return url;
+/* ── BLOB ACCESSORS ─────────────────────────────────── */
+function blobSchedule(dateStr) {
+  return HAS_BLOB ? (MLB_DATA.schedule[dateStr] || []) : null;
+}
+function blobRoster(teamId, season) {
+  return HAS_BLOB ? (MLB_DATA.rosters[`${teamId}-${season}`] || []) : null;
+}
+function blobPlayer(playerId) {
+  return HAS_BLOB ? (MLB_DATA.players[String(playerId)] || null) : null;
+}
+function blobHitStats(playerId, season) {
+  const p = blobPlayer(playerId);
+  return p ? (p.hitStats[String(season)] || {}) : null;
+}
+function blobPitStats(playerId, season) {
+  const p = blobPlayer(playerId);
+  return p ? (p.pitStats[String(season)] || {}) : null;
+}
+function blobRecentHit(playerId, season) {
+  const p = blobPlayer(playerId);
+  return p ? (p.recentHit[String(season)] || {}) : null;
+}
+function blobRecentPit(playerId, season) {
+  const p = blobPlayer(playerId);
+  return p ? (p.recentPit[String(season)] || {}) : null;
+}
+function blobH2H(batterId, pitcherId) {
+  return HAS_BLOB ? (MLB_DATA.h2h[`${batterId}-${pitcherId}`] || null) : null;
+}
+function blobBio(playerId) {
+  const p = blobPlayer(playerId);
+  return p ? p.bio : null;
 }
 
+/* ── LIVE API FALLBACK ──────────────────────────────── */
 const BASE = 'https://statsapi.mlb.com/api/v1';
+const PROXY = 'https://corsproxy.io/?url=';
 
-async function fetchJSON(url) {
-  const r = await fetch(proxyURL(url));
-  if (!r.ok) throw new Error(`HTTP ${r.status} — ${r.url}`);
+async function apiFetch(url) {
+  const r = await fetch(PROXY + encodeURIComponent(url));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
 
-/* Schedule with probable pitchers */
-async function getSchedule(date) {
-  const url = `${BASE}/schedule?sportId=1&date=${date}&hydrate=probablePitcher,team,linescore&gameType=R`;
-  const data = await fetchJSON(url);
-  const games = [];
-  for (const d of (data.dates || [])) {
-    for (const g of (d.games || [])) {
-      if (['Scheduled','Pre-Game','Warmup','In Progress'].includes(g.status?.detailedState)) {
-        games.push(g);
-      }
-    }
-  }
-  return games;
+async function liveSchedule(dateStr) {
+  const data = await apiFetch(`${BASE}/schedule?sportId=1&date=${dateStr}&hydrate=probablePitcher,team&gameType=R`);
+  return (data.dates || []).flatMap(d => d.games || [])
+    .filter(g => ['Scheduled','Pre-Game','Warmup','In Progress'].includes(g.status?.detailedState))
+    .map(g => {
+      const away = g.teams.away, home = g.teams.home;
+      const t = g.gameDate ? new Date(g.gameDate).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',timeZoneName:'short'}) : 'TBD';
+      return {
+        away: away.team?.abbreviation, home: home.team?.abbreviation,
+        awayId: away.team?.id, homeId: home.team?.id,
+        awayPit: away.probablePitcher?.id, awayPitN: away.probablePitcher?.fullName,
+        homePit: home.probablePitcher?.id, homePitN: home.probablePitcher?.fullName,
+        time: t,
+      };
+    });
 }
 
-/* Season hitting stats for a player */
-async function getHitterStats(playerId, season) {
+async function liveHitStats(id, season) {
   try {
-    const url = `${BASE}/people/${playerId}/stats?stats=season&group=hitting&season=${season}`;
-    const data = await fetchJSON(url);
-    const s = data.stats?.[0]?.splits?.[0]?.stat || {};
-    return {
-      avg:  parseFloat(s.avg  || 0),
-      ops:  parseFloat(s.ops  || 0),
-      hr:   parseInt(s.homeRuns || 0),
-      rbi:  parseInt(s.rbi  || 0),
-      obp:  parseFloat(s.obp || 0),
-      slg:  parseFloat(s.slg || 0),
-      ab:   parseInt(s.atBats || 0),
-      so:   parseInt(s.strikeOuts || 0),
-    };
+    const d = await apiFetch(`${BASE}/people/${id}/stats?stats=season&group=hitting&season=${season}`);
+    const s = d.stats?.[0]?.splits?.[0]?.stat || {};
+    return { avg:+s.avg||0, ops:+s.ops||0, hr:+s.homeRuns||0, rbi:+s.rbi||0, ab:+s.atBats||0, obp:+s.obp||0, slg:+s.slg||0 };
   } catch { return {}; }
 }
-
-/* Season pitching stats */
-async function getPitcherStats(playerId, season) {
+async function livePitStats(id, season) {
   try {
-    const url = `${BASE}/people/${playerId}/stats?stats=season&group=pitching&season=${season}`;
-    const data = await fetchJSON(url);
-    const s = data.stats?.[0]?.splits?.[0]?.stat || {};
-    return {
-      era:   parseFloat(s.era  || 99),
-      whip:  parseFloat(s.whip || 99),
-      kp9:   parseFloat(s.strikeoutsPer9Inn || 0),
-      bb9:   parseFloat(s.walksPer9Inn || 99),
-      ip:    parseFloat(s.inningsPitched || 0),
-      kPct:  s.strikeOuts && s.battersFaced ? parseInt(s.strikeOuts)/parseInt(s.battersFaced) : 0,
-      wins:  parseInt(s.wins || 0),
-      so:    parseInt(s.strikeOuts || 0),
-    };
+    const d = await apiFetch(`${BASE}/people/${id}/stats?stats=season&group=pitching&season=${season}`);
+    const s = d.stats?.[0]?.splits?.[0]?.stat || {};
+    const era = +s.era||99, whip = +s.whip||99;
+    return { era: era<99?era:null, whip: whip<99?whip:null, kp9:+s.strikeoutsPer9Inn||0, ip:+s.inningsPitched||0 };
   } catch { return {}; }
 }
-
-/* Last 14 days rolling hitting */
-async function getRecentHitting(playerId, season) {
+async function liveRecentHit(id, season) {
   try {
-    const url = `${BASE}/people/${playerId}/stats?stats=lastXGames&group=hitting&season=${season}&limit=14`;
-    const data = await fetchJSON(url);
-    const s = data.stats?.[0]?.splits?.[0]?.stat || {};
-    return { avg: parseFloat(s.avg || 0), ops: parseFloat(s.ops || 0), hr: parseInt(s.homeRuns || 0) };
+    const d = await apiFetch(`${BASE}/people/${id}/stats?stats=lastXGames&group=hitting&season=${season}&limit=14`);
+    const s = d.stats?.[0]?.splits?.[0]?.stat || {};
+    return { avg:+s.avg||0, ops:+s.ops||0, hr:+s.homeRuns||0 };
   } catch { return {}; }
 }
-
-/* Last 14 days rolling pitching */
-async function getRecentPitching(playerId, season) {
+async function liveRecentPit(id, season) {
   try {
-    const url = `${BASE}/people/${playerId}/stats?stats=lastXGames&group=pitching&season=${season}&limit=14`;
-    const data = await fetchJSON(url);
-    const s = data.stats?.[0]?.splits?.[0]?.stat || {};
-    return { era: parseFloat(s.era || 99), ip: parseFloat(s.inningsPitched || 0) };
+    const d = await apiFetch(`${BASE}/people/${id}/stats?stats=lastXGames&group=pitching&season=${season}&limit=14`);
+    const s = d.stats?.[0]?.splits?.[0]?.stat || {};
+    const era = +s.era||99;
+    return { era: era<99?era:null, ip:+s.inningsPitched||0 };
   } catch { return {}; }
 }
-
-/* Head-to-head batter vs pitcher */
-async function getH2H(batterId, pitcherId) {
+async function liveH2H(batId, pitId) {
   try {
-    const url = `${BASE}/people/${batterId}/stats?stats=vsPlayer&opposingPlayerId=${pitcherId}&group=hitting&sportId=1`;
-    const data = await fetchJSON(url);
-    const s = data.stats?.[0]?.splits?.[0]?.stat || null;
-    if (!s) return null;
-    return {
-      ab:  parseInt(s.atBats || 0),
-      avg: parseFloat(s.avg  || 0),
-      hr:  parseInt(s.homeRuns || 0),
-      ops: parseFloat(s.ops  || 0),
-    };
+    const d = await apiFetch(`${BASE}/people/${batId}/stats?stats=vsPlayer&opposingPlayerId=${pitId}&group=hitting&sportId=1`);
+    const s = d.stats?.[0]?.splits?.[0]?.stat;
+    if (!s || +s.atBats < 3) return null;
+    return { ab:+s.atBats, avg:+s.avg||0, hr:+s.homeRuns||0, ops:+s.ops||0 };
   } catch { return null; }
 }
-
-/* Player bio (hand) */
-async function getPlayerInfo(playerId) {
+async function liveBio(id) {
   try {
-    const data = await fetchJSON(`${BASE}/people/${playerId}`);
-    const p = data.people?.[0] || {};
-    return { batSide: p.batSide?.code || '?', pitchHand: p.pitchHand?.code || '?' };
-  } catch { return { batSide: '?', pitchHand: '?' }; }
+    const d = await apiFetch(`${BASE}/people/${id}`);
+    const p = d.people?.[0] || {};
+    return { batSide: p.batSide?.code||'?', pitchHand: p.pitchHand?.code||'?' };
+  } catch { return { batSide:'?', pitchHand:'?' }; }
+}
+async function liveRoster(teamId, season) {
+  try {
+    const d = await apiFetch(`${BASE}/teams/${teamId}/roster?rosterType=active&season=${season}`);
+    return (d.roster||[]).filter(p=>!['P','TWP'].includes(p.position?.code))
+      .slice(0,9).map(p=>({ id:p.person.id, name:p.person.fullName, pos:p.position?.abbreviation||'' }));
+  } catch { return []; }
 }
 
-/* Top batters from a team's lineup (roster) */
-async function getTopBatters(teamId, season) {
-  try {
-    const url = `${BASE}/teams/${teamId}/roster?rosterType=active&season=${season}`;
-    const data = await fetchJSON(url);
-    const hitters = (data.roster || []).filter(p =>
-      !['P','TWP'].includes(p.position?.code)
-    );
-    return hitters.slice(0, 9).map(p => ({ id: p.person?.id, name: p.person?.fullName, pos: p.position?.abbreviation }));
-  } catch { return []; }
+/* ── UNIFIED DATA LAYER ─────────────────────────────── */
+async function getSchedule(dateStr) {
+  if (HAS_BLOB) return blobSchedule(dateStr);
+  return liveSchedule(dateStr);
+}
+async function getRoster(teamId, season) {
+  const b = blobRoster(teamId, season);
+  if (b !== null) return b;
+  return liveRoster(teamId, season);
+}
+async function getHitStats(id, season) {
+  const b = blobHitStats(id, season);
+  if (b !== null) return b;
+  return liveHitStats(id, season);
+}
+async function getPitStats(id, season) {
+  const b = blobPitStats(id, season);
+  if (b !== null) return b;
+  return livePitStats(id, season);
+}
+async function getRecentHit(id, season) {
+  const b = blobRecentHit(id, season);
+  if (b !== null) return b;
+  return liveRecentHit(id, season);
+}
+async function getRecentPit(id, season) {
+  const b = blobRecentPit(id, season);
+  if (b !== null) return b;
+  return liveRecentPit(id, season);
+}
+async function getH2H(batId, pitId) {
+  const b = blobH2H(batId, pitId);
+  if (b !== null) return b;
+  return liveH2H(batId, pitId);
+}
+async function getBio(id) {
+  const b = blobBio(id);
+  if (b !== null) return b;
+  return liveBio(id);
 }
 
 /* ── SCORING ENGINE ─────────────────────────────────── */
 function scoreMatchup(hStat, pStat, h2h, recentH, recentP, batSide, pitchHand) {
-  let score = 50; // baseline
+  let score = 50;
   const reasons = [];
 
-  // 1. Batter OPS (season)
-  if (hStat.ops >= 0.900) { score += 18; reasons.push({ text: `OPS ${hStat.ops.toFixed(3)}`, type: 'plus' }); }
-  else if (hStat.ops >= 0.800) { score += 10; reasons.push({ text: `OPS ${hStat.ops.toFixed(3)}`, type: 'plus' }); }
+  if (hStat.ops >= 0.900)      { score += 18; reasons.push({ text:`OPS ${hStat.ops.toFixed(3)}`, type:'plus' }); }
+  else if (hStat.ops >= 0.800) { score += 10; reasons.push({ text:`OPS ${hStat.ops.toFixed(3)}`, type:'plus' }); }
   else if (hStat.ops >= 0.700) { score += 4; }
-  else if (hStat.ops > 0) { score -= 5; reasons.push({ text: `OPS ${hStat.ops.toFixed(3)}`, type: 'warn' }); }
+  else if (hStat.ops > 0)      { score -= 5;  reasons.push({ text:`OPS ${hStat.ops.toFixed(3)}`, type:'warn' }); }
 
-  // 2. Pitcher ERA (season)
-  if (pStat.era < 3.00) { score -= 14; reasons.push({ text: `P ERA ${pStat.era.toFixed(2)}`, type: 'warn' }); }
-  else if (pStat.era < 4.00) { score -= 6; }
-  else if (pStat.era >= 4.50) { score += 10; reasons.push({ text: `P ERA ${pStat.era.toFixed(2)}`, type: 'plus' }); }
-  else if (pStat.era >= 5.00) { score += 16; reasons.push({ text: `P ERA ${pStat.era.toFixed(2)}`, type: 'plus' }); }
+  const era = pStat.era;
+  if (era !== null && era !== undefined) {
+    if (era < 3.00)      { score -= 14; reasons.push({ text:`P ERA ${era.toFixed(2)}`, type:'warn' }); }
+    else if (era < 4.00) { score -= 6; }
+    else if (era >= 5.00){ score += 16; reasons.push({ text:`P ERA ${era.toFixed(2)}`, type:'plus' }); }
+    else if (era >= 4.50){ score += 10; reasons.push({ text:`P ERA ${era.toFixed(2)}`, type:'plus' }); }
+  }
 
-  // 3. Pitcher K/9
-  if (pStat.kp9 >= 10) { score -= 8; reasons.push({ text: `K/9 ${pStat.kp9.toFixed(1)}`, type: 'warn' }); }
-  else if (pStat.kp9 <= 7) { score += 5; }
+  if (pStat.kp9 >= 10)      { score -= 8; reasons.push({ text:`K/9 ${pStat.kp9.toFixed(1)}`, type:'warn' }); }
+  else if (pStat.kp9 <= 7)  { score += 5; }
 
-  // 4. Handedness advantage
-  const advL = batSide === 'L' && pitchHand === 'R';
-  const advR = batSide === 'R' && pitchHand === 'L';
-  const sameHand = batSide === pitchHand;
-  if (advL || advR) { score += 8; reasons.push({ text: `${batSide}HB vs ${pitchHand}HP`, type: 'plus' }); }
-  else if (sameHand) { score -= 4; reasons.push({ text: `${batSide}HB vs ${pitchHand}HP`, type: 'warn' }); }
+  const advL = batSide==='L' && pitchHand==='R';
+  const advR = batSide==='R' && pitchHand==='L';
+  const same = batSide === pitchHand;
+  if (advL || advR) { score += 8; reasons.push({ text:`${batSide}HB vs ${pitchHand}HP ✓`, type:'plus' }); }
+  else if (same)    { score -= 4; reasons.push({ text:`${batSide}HB vs ${pitchHand}HP`, type:'warn' }); }
 
-  // 5. Recent batter form (L14 days)
-  if (recentH.ops >= 0.950) { score += 12; reasons.push({ text: 'HOT: OPS '+recentH.ops.toFixed(3), type: 'plus' }); }
-  else if (recentH.ops >= 0.800) { score += 6; }
-  else if (recentH.ops > 0 && recentH.ops < 0.600) { score -= 6; reasons.push({ text: 'COLD: OPS '+recentH.ops.toFixed(3), type: 'warn' }); }
+  if (recentH.ops >= 0.950)     { score += 12; reasons.push({ text:`🔥 L14 OPS ${recentH.ops.toFixed(3)}`, type:'plus' }); }
+  else if (recentH.ops >= 0.800){ score += 6; }
+  else if (recentH.ops > 0 && recentH.ops < 0.600) { score -= 6; reasons.push({ text:`COLD L14 OPS ${recentH.ops.toFixed(3)}`, type:'warn' }); }
 
-  // 6. Recent pitcher form (L14 days)
-  if (recentP.era > 0 && recentP.era >= 5.00 && recentP.ip >= 3) { score += 10; reasons.push({ text: `P recent ERA ${recentP.era.toFixed(2)}`, type: 'plus' }); }
-  else if (recentP.era > 0 && recentP.era < 2.00 && recentP.ip >= 3) { score -= 8; reasons.push({ text: `P recent ERA ${recentP.era.toFixed(2)}`, type: 'warn' }); }
+  if (recentP.era !== null && recentP.era !== undefined) {
+    if (recentP.era >= 5.00 && recentP.ip >= 3)      { score += 10; reasons.push({ text:`P recent ERA ${recentP.era.toFixed(2)}`, type:'plus' }); }
+    else if (recentP.era < 2.00 && recentP.ip >= 3)  { score -= 8;  reasons.push({ text:`P recent ERA ${recentP.era.toFixed(2)}`, type:'warn' }); }
+  }
 
-  // 7. H2H
   if (h2h && h2h.ab >= 5) {
-    if (h2h.avg >= 0.350) { score += 10; reasons.push({ text: `H2H .${Math.round(h2h.avg*1000)} (${h2h.ab} AB)`, type: 'plus' }); }
-    else if (h2h.avg <= 0.150 && h2h.ab >= 8) { score -= 8; reasons.push({ text: `H2H .${Math.round(h2h.avg*1000)} (${h2h.ab} AB)`, type: 'warn' }); }
+    if (h2h.avg >= 0.350)           { score += 10; reasons.push({ text:`H2H .${String(Math.round(h2h.avg*1000)).padStart(3,'0')} (${h2h.ab} AB)`, type:'plus' }); }
+    else if (h2h.avg <= 0.150 && h2h.ab >= 8) { score -= 8; reasons.push({ text:`H2H .${String(Math.round(h2h.avg*1000)).padStart(3,'0')} (${h2h.ab} AB)`, type:'warn' }); }
     if (h2h.hr >= 2) { score += 6; }
   }
 
-  score = clamp(score, 5, 99);
-  return { score, reasons: reasons.slice(0, 4) };
+  return { score: clamp(Math.round(score), 5, 99), reasons: reasons.slice(0,4) };
 }
 
 /* ── CARD RENDERER ──────────────────────────────────── */
-function renderCard(rank, batter, pitcher, game, hStat, pStat, h2h, recentH, recentP, batInfo, pitInfo) {
-  const { score, reasons } = scoreMatchup(hStat, pStat, h2h, recentH, recentP, batInfo.batSide, pitInfo.pitchHand);
-  const pct = score;
-  const stars = Math.round(pct / 20);
-  const hasAdv = (batInfo.batSide === 'L' && pitInfo.pitchHand === 'R') || (batInfo.batSide === 'R' && pitInfo.pitchHand === 'L');
-
-  const statChip = (label, val) => val !== undefined && val !== null && val !== '' && val !== 0
-    ? `<div class="stat-chip"><span>${label}</span>${val}</div>` : '';
+function renderCard(rank, batter, pitcher, game, hStat, pStat, h2h, recentH, recentP, batBio, pitBio) {
+  const { score, reasons } = scoreMatchup(hStat, pStat, h2h, recentH, recentP, batBio.batSide, pitBio.pitchHand);
+  const stars = Math.round(score / 20);
+  const hasAdv = (batBio.batSide==='L' && pitBio.pitchHand==='R') || (batBio.batSide==='R' && pitBio.pitchHand==='L');
+  const avgFmt = v => v ? '.'+String(Math.round(v*1000)).padStart(3,'0') : '---';
+  const chip = (lbl, val) => val ? `<div class="stat-chip"><span>${lbl}</span>${val}</div>` : '';
+  const gameTime = game.time ? new Date(game.time).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',timeZoneName:'short'}) : game.time || 'TBD';
 
   const h2hHtml = h2h && h2h.ab >= 3 ? `
     <div class="h2h-box">
       <span class="h2h-label">H2H</span>
       <span class="h2h-stat"><strong>${h2h.ab}</strong> AB</span>
-      <span class="h2h-stat"><strong>${h2h.avg ? '.'+String(Math.round(h2h.avg*1000)).padStart(3,'0') : '---'}</strong> AVG</span>
+      <span class="h2h-stat"><strong>${avgFmt(h2h.avg)}</strong> AVG</span>
       ${h2h.hr ? `<span class="h2h-stat"><strong>${h2h.hr}</strong> HR</span>` : ''}
       ${h2h.ops ? `<span class="h2h-stat"><strong>${h2h.ops.toFixed(3)}</strong> OPS</span>` : ''}
     </div>` : '';
 
-  const reasonPills = reasons.map(r =>
-    `<span class="reason-pill ${r.type}">${r.text}</span>`
-  ).join('');
-
-  const starHtml = [1,2,3,4,5].map(i =>
-    `<span class="star${i <= stars ? ' lit' : ''}">★</span>`
-  ).join('');
-
-  const avgFmt = v => v ? '.'+String(Math.round(v*1000)).padStart(3,'0') : '---';
+  const starHtml = [1,2,3,4,5].map(i => `<span class="star${i<=stars?' lit':''}">★</span>`).join('');
+  const pillsHtml = reasons.map(r => `<span class="reason-pill ${r.type}">${r.text}</span>`).join('');
 
   return `
   <div class="matchup-card">
     <div class="rank-badge"></div>
     <div class="rank-number">${rank}</div>
-
     <div class="card-band">
       <span class="game-label">${game.away} <span style="color:#6b8aad">@</span> ${game.home}</span>
-      <span class="score-badge">${game.time}</span>
+      <span class="score-badge">${gameTime}</span>
     </div>
-
     <div class="card-body">
-      <!-- BATTER -->
       <div class="player-half batter">
         <div class="player-role">Batter</div>
         <div class="player-name">${batter.name}</div>
-        <div class="player-team">${batter.team} · ${batter.pos || ''}</div>
-        <div class="hand-badge${hasAdv ? ' advantage' : ''}">${batInfo.batSide === 'L' ? 'LHB' : batInfo.batSide === 'R' ? 'RHB' : 'SHB'}</div>
+        <div class="player-team">${batter.team} · ${batter.pos||''}</div>
+        <div class="hand-badge${hasAdv?' advantage':''}">${batBio.batSide==='L'?'LHB':batBio.batSide==='R'?'RHB':'SHB'}</div>
         <div class="stat-row">
-          ${statChip('AVG', avgFmt(hStat.avg))}
-          ${statChip('OPS', hStat.ops ? hStat.ops.toFixed(3) : '---')}
-          ${hStat.hr ? statChip('HR', hStat.hr) : ''}
+          ${chip('AVG', avgFmt(hStat.avg))}
+          ${chip('OPS', hStat.ops ? hStat.ops.toFixed(3) : '')}
+          ${hStat.hr ? chip('HR', hStat.hr) : ''}
         </div>
         ${recentH.ops >= 0.850 ? `<div class="stat-row"><div class="stat-chip hot">🔥 L14 OPS ${recentH.ops.toFixed(3)}</div></div>` : ''}
       </div>
-
-      <!-- VS -->
       <div class="vs-divider">VS</div>
-
-      <!-- PITCHER -->
       <div class="player-half pitcher">
         <div class="player-role">Pitcher</div>
         <div class="player-name">${pitcher.name}</div>
         <div class="player-team">${pitcher.team}</div>
-        <div class="hand-badge">${pitInfo.pitchHand === 'L' ? 'LHP' : 'RHP'}</div>
+        <div class="hand-badge">${pitBio.pitchHand==='L'?'LHP':'RHP'}</div>
         <div class="stat-row">
-          ${statChip('ERA', pStat.era && pStat.era < 99 ? pStat.era.toFixed(2) : '---')}
-          ${statChip('WHIP', pStat.whip && pStat.whip < 99 ? pStat.whip.toFixed(2) : '---')}
-          ${statChip('K/9', pStat.kp9 ? pStat.kp9.toFixed(1) : '---')}
+          ${chip('ERA', pStat.era!=null ? pStat.era.toFixed(2) : '')}
+          ${chip('WHIP', pStat.whip!=null ? pStat.whip.toFixed(2) : '')}
+          ${chip('K/9', pStat.kp9 ? pStat.kp9.toFixed(1) : '')}
         </div>
       </div>
     </div>
-
     <div class="score-section">
       <div class="score-label">Matchup Score</div>
       <div class="score-bar-wrap">
         <div class="score-num">${score}</div>
         <div class="score-bar">
-          <div class="score-fill" style="width:${pct}%;background:${scoreColor(pct)}"></div>
+          <div class="score-fill" style="width:${score}%;background:${scoreColor(score)}"></div>
         </div>
         <div class="score-stars">${starHtml}</div>
       </div>
       ${h2hHtml}
-      <div class="reasons-row">${reasonPills}</div>
+      <div class="reasons-row">${pillsHtml}</div>
     </div>
   </div>`;
 }
 
 /* ── SKELETON ───────────────────────────────────────── */
 function showSkeletons() {
-  const grid = $('cards-grid');
-  grid.innerHTML = Array(5).fill('<div class="skeleton-card"></div>').join('');
+  $('cards-grid').innerHTML = Array(5).fill('<div class="skeleton-card"></div>').join('');
 }
 
 /* ── MAIN LOAD ──────────────────────────────────────── */
 async function loadMatchups() {
   const dateVal = $('date-picker').value;
   if (!dateVal) { setStatus('Please pick a date first.', 'error'); return; }
+  const season = dateVal.slice(0,4);
 
   $('header-date').textContent = fmt(dateVal);
-  setStatus('Fetching today\'s schedule…', 'loading');
+  setStatus(HAS_BLOB ? '⚡ Loading from pre-fetched data…' : '🌐 Fetching live data…', 'loading');
   showSkeletons();
 
   try {
-    const season = dateVal.slice(0,4);
     const games = await getSchedule(dateVal);
 
-    if (!games.length) {
+    if (!games || !games.length) {
       $('cards-grid').innerHTML = `<div class="empty-state"><div class="icon">⚾</div><p>No games scheduled</p><small>${fmt(dateVal)}</small></div>`;
       setStatus('No MLB games found for this date.', 'error');
       return;
     }
 
-    setStatus(`Found ${games.length} game(s). Pulling pitcher & batter data…`, 'loading');
+    setStatus(`Found ${games.length} game(s) — ranking matchups…`, 'loading');
 
-    // Collect probable pitchers from all games
-    const candidates = [];
-    for (const g of games) {
-      const away = g.teams?.away, home = g.teams?.home;
-      const awayPit = away?.probablePitcher, homePit = home?.probablePitcher;
-      const time = g.gameDate ? new Date(g.gameDate).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',timeZoneName:'short'}) : 'TBD';
-
-      if (awayPit) candidates.push({ pitcherId: awayPit.id, pitcherName: awayPit.fullName, pitcherTeam: away.team?.abbreviation || away.team?.name, battingTeamId: home.team?.id, battingTeamName: home.team?.abbreviation || home.team?.name, game: { away: away.team?.abbreviation, home: home.team?.abbreviation, time } });
-      if (homePit) candidates.push({ pitcherId: homePit.id, pitcherName: homePit.fullName, pitcherTeam: home.team?.abbreviation || home.team?.name, battingTeamId: away.team?.id, battingTeamName: away.team?.abbreviation || away.team?.name, game: { away: away.team?.abbreviation, home: home.team?.abbreviation, time } });
-    }
-
-    if (!candidates.length) {
-      $('cards-grid').innerHTML = `<div class="empty-state"><div class="icon">📋</div><p>No probable pitchers announced yet</p><small>Check back closer to game time.</small></div>`;
-      setStatus('Probable pitchers not yet posted for this date.', 'error');
-      return;
-    }
-
-    setStatus(`Analyzing ${candidates.length} pitcher/team combo(s)…`, 'loading');
-
-    // For each pitcher, get top batters and score every matchup
     const allMatchups = [];
+    const SLEEP = HAS_BLOB ? 0 : 80;
 
-    for (const c of candidates) {
-      const [pitStat, pitInfo, batters] = await Promise.all([
-        getPitcherStats(c.pitcherId, season),
-        getPlayerInfo(c.pitcherId),
-        getTopBatters(c.battingTeamId, season),
-      ]);
-      const recentP = await getRecentPitching(c.pitcherId, season);
+    for (const g of games) {
+      const pitchers = [];
+      if (g.awayPit) pitchers.push({ id: g.awayPit, name: g.awayPitN, team: g.away, battingTeamId: g.homeId, battingTeam: g.home });
+      if (g.homePit) pitchers.push({ id: g.homePit, name: g.homePitN, team: g.home, battingTeamId: g.awayId, battingTeam: g.away });
 
-      for (const batter of batters.slice(0, 5)) {
-        if (!batter.id) continue;
-        const [hStat, batInfo, h2h, recentH] = await Promise.all([
-          getHitterStats(batter.id, season),
-          getPlayerInfo(batter.id),
-          getH2H(batter.id, c.pitcherId),
-          getRecentHitting(batter.id, season),
+      for (const pit of pitchers) {
+        const [pitStat, pitBio, roster] = await Promise.all([
+          getPitStats(pit.id, season),
+          getBio(pit.id),
+          getRoster(pit.battingTeamId, season),
         ]);
+        const recentP = await getRecentPit(pit.id, season);
 
-        if (!hStat.ab || hStat.ab < 20) continue; // skip light samples
+        for (const batter of roster.slice(0, 5)) {
+          const [hStat, batBio, h2h, recentH] = await Promise.all([
+            getHitStats(batter.id, season),
+            getBio(batter.id),
+            getH2H(batter.id, pit.id),
+            getRecentHit(batter.id, season),
+          ]);
 
-        const { score } = scoreMatchup(hStat, pitStat, h2h, recentH, recentP, batInfo.batSide, pitInfo.pitchHand);
-        allMatchups.push({
-          score, batter: { ...batter, team: c.battingTeamName },
-          pitcher: { id: c.pitcherId, name: c.pitcherName, team: c.pitcherTeam },
-          game: c.game, hStat, pitStat, h2h, recentH, recentP, batInfo, pitInfo
-        });
+          if (!hStat.ab || hStat.ab < 20) continue;
+
+          const { score } = scoreMatchup(hStat, pitStat || {}, h2h, recentH, recentP, batBio.batSide, pitBio.pitchHand);
+          allMatchups.push({
+            score,
+            batter: { ...batter, team: pit.battingTeam },
+            pitcher: { id: pit.id, name: pit.name, team: pit.team },
+            game: { away: g.away, home: g.home, time: g.time },
+            hStat, pitStat: pitStat||{}, h2h, recentH, recentP: recentP||{}, batBio, pitBio
+          });
+        }
+        if (SLEEP) await new Promise(r => setTimeout(r, SLEEP));
       }
-
-      await sleep(80); // gentle throttle
     }
 
     if (!allMatchups.length) {
-      $('cards-grid').innerHTML = `<div class="empty-state"><div class="icon">📊</div><p>Not enough stat data available</p><small>Try a date during the regular season.</small></div>`;
+      $('cards-grid').innerHTML = `<div class="empty-state"><div class="icon">📊</div><p>Not enough stat data available</p><small>Try a regular-season date (Apr–Oct). Run the fetcher script for 2023–2025 instant mode.</small></div>`;
       setStatus('Insufficient stat data for this date.', '');
       return;
     }
 
-    // Sort descending, take top 5 (dedupe batters)
     const seen = new Set();
     const top5 = allMatchups
       .sort((a,b) => b.score - a.score)
-      .filter(m => { const key = m.batter.id+'-'+m.pitcher.id; if (seen.has(key)) return false; seen.add(key); return true; })
+      .filter(m => { const k = `${m.batter.id}-${m.pitcher.id}`; if (seen.has(k)) return false; seen.add(k); return true; })
       .slice(0, 5);
 
-    $('cards-grid').innerHTML = top5.map((m, i) =>
-      renderCard(i+1, m.batter, m.pitcher, m.game, m.hStat, m.pitStat, m.h2h, m.recentH, m.recentP, m.batInfo, m.pitInfo)
+    $('cards-grid').innerHTML = top5.map((m,i) =>
+      renderCard(i+1, m.batter, m.pitcher, m.game, m.hStat, m.pitStat, m.h2h, m.recentH, m.recentP, m.batBio, m.pitBio)
     ).join('');
 
-    setStatus(`✔ Top ${top5.length} matchups ranked for ${fmt(dateVal)}`, '');
+    setStatus(`✔ Top ${top5.length} matchups for ${fmt(dateVal)}${HAS_BLOB ? ' — instant mode' : ''}`, '');
 
   } catch (err) {
     console.error(err);
     $('cards-grid').innerHTML = '';
-    setStatus(`Error: ${err.message}. Check console for details.`, 'error');
+    setStatus(`Error: ${err.message}`, 'error');
   }
 }
 
-function setStatus(msg, cls = '') {
+function setStatus(msg, cls='') {
   const el = $('status-bar');
   el.textContent = msg;
   el.className = 'status-bar ' + cls;
@@ -856,11 +851,15 @@ function setStatus(msg, cls = '') {
 
 /* ── INIT ───────────────────────────────────────────── */
 (function init() {
-  const dp = $('date-picker');
-  dp.value = today();
+  $('date-picker').value = today();
   $('header-date').textContent = fmt(today());
+  if (HAS_BLOB) {
+    $('data-mode-banner').style.display = 'block';
+    const built = MLB_DATA.meta?.built;
+    const seasons = MLB_DATA.meta?.seasons?.join(', ');
+    if (built) $('data-mode-banner').textContent = `⚡ INSTANT MODE · Seasons ${seasons} · Built ${built}`;
+  }
 })();
 </script>
 </body>
 </html>
-```
