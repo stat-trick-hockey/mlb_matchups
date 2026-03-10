@@ -13,7 +13,7 @@ Usage:
     python fetch_mlb_data.py --inject mlb-matchups.html
 """
 
-import sys, json, time, argparse, os, re
+import sys, json, time, argparse, os
 from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
@@ -377,26 +377,23 @@ def inject_into_html(data, html_path):
     if not os.path.exists(html_path):
         print(f"  ✗ HTML file not found: {html_path}")
         return
-    with open(html_path, "r") as f:
+    with open(html_path, "r", encoding="utf-8") as f:
         html = f.read()
 
-    blob = json.dumps(data, separators=(",",":"))
+    blob = json.dumps(data, separators=(",",":"), ensure_ascii=True)
     marker_start = "/* __MLB_DATA_START__ */"
     marker_end   = "/* __MLB_DATA_END__ */"
     replacement  = f"{marker_start}\nconst MLB_DATA = {blob};\n{marker_end}"
 
-    if marker_start in html:
-        html = re.sub(
-            re.escape(marker_start) + r".*?" + re.escape(marker_end),
-            replacement,
-            html,
-            flags=re.DOTALL
-        )
+    if marker_start in html and marker_end in html:
+        # Plain string slice — avoids regex choking on \u escapes in the blob
+        start_idx = html.index(marker_start)
+        end_idx   = html.index(marker_end) + len(marker_end)
+        html = html[:start_idx] + replacement + html[end_idx:]
     else:
-        # Insert before closing </script> of the init block
         html = html.replace("/* __INSERT_DATA_HERE__ */", replacement)
 
-    with open(html_path, "w") as f:
+    with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
     size_kb = len(blob) / 1024
     print(f"  ✔ Injected {size_kb:.0f} KB into {html_path}")
