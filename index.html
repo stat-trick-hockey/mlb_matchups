@@ -444,6 +444,11 @@
 
 <div class="controls">
   <input type="date" class="date-input" id="date-picker" />
+  <select class="date-input" id="proxy-select" title="CORS Proxy">
+    <option value="corsproxy">Proxy: corsproxy.io</option>
+    <option value="allorigins">Proxy: allorigins</option>
+    <option value="direct">Direct (local only)</option>
+  </select>
   <button class="btn btn-primary" onclick="loadMatchups()">▶ LOAD MATCHUPS</button>
 </div>
 
@@ -470,11 +475,27 @@ function scoreColor(pct) {
 }
 
 /* ── API HELPERS ────────────────────────────────────── */
+// CORS proxy — needed for GitHub Pages (browser can't hit statsapi.mlb.com directly).
+// Options:
+//   'corsproxy'  → https://corsproxy.io  (free, no setup)
+//   'allorigins' → https://api.allorigins.win (free, no setup, slightly slower)
+//   'custom'     → set CUSTOM_PROXY below to your own Cloudflare Worker URL
+const PROXY_MODE = 'corsproxy';
+const CUSTOM_PROXY = ''; // e.g. 'https://my-worker.example.workers.dev/?url='
+
+function proxyURL(url) {
+  const mode = document.getElementById('proxy-select')?.value || PROXY_MODE;
+  if (mode === 'corsproxy')  return `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
+  if (mode === 'allorigins') return `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+  if (mode === 'custom' && CUSTOM_PROXY) return CUSTOM_PROXY + encodeURIComponent(url);
+  return url;
+}
+
 const BASE = 'https://statsapi.mlb.com/api/v1';
 
 async function fetchJSON(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const r = await fetch(proxyURL(url));
+  if (!r.ok) throw new Error(`HTTP ${r.status} — ${r.url}`);
   return r.json();
 }
 
