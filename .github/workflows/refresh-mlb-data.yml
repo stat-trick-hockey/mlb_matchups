@@ -1,0 +1,153 @@
+name: Refresh MLB Matchup Data
+
+on:
+  # Every Monday at 6am ET (10:00 UTC) during baseball season
+  schedule:
+    - cron: '0 10 * * 1'
+
+  # Also run on the 1st of April each year (season kickoff refresh)
+  # (handled by the Monday schedule naturally, but noted here for clarity)
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: 'Seasons to fetch (space-separated, e.g. "2023 2024 2025")'
+        required: false
+        default: '2023 2024 2025'
+      html_path:
+        description: 'Path to HTML file to inject data into'
+        required: false
+        default: 'index.html'
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # Only run between April and November (baseball season + offseason buffer)
+    # For manual dispatch, always run regardless of month
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'schedule' &&
+        (
+          contains('04 05 06 07 08 09 10 11', format('{0}', ''))
+        )
+      )
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-requests
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Determine seasons to fetch
+        id: seasons
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.seasons }}" ]; then
+            echo "seasons=${{ inputs.seasons }}" >> $GITHUB_OUTPUT
+          else
+            # Auto-detect: current year + 2 prior seasons
+            YEAR=$(date +%Y)
+            PREV1=$((YEAR - 1))
+            PREV2=$((YEAR - 2))
+            echo "seasons=${PREV2} ${PREV1} ${YEAR}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine HTML path
+        id: htmlpath
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.html_path }}" ]; then
+            echo "path=${{ inputs.html_path }}" >> $GITHUB_OUTPUT
+          else
+            echo "path=index.html" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check HTML file exists
+        run: |
+          if [ ! -f "${{ steps.htmlpath.outputs.path }}" ]; then
+            echo "❌ HTML file not found: ${{ steps.htmlpath.outputs.path }}"
+            echo "Make sure index.html is committed to your repo root."
+            exit 1
+          fi
+          echo "✅ Found: ${{ steps.htmlpath.outputs.path }}"
+
+      - name: Fetch MLB data and inject into HTML
+        run: |
+          python fetch_mlb_data.py \
+            --seasons ${{ steps.seasons.outputs.seasons }} \
+            --inject "${{ steps.htmlpath.outputs.path }}" \
+            --out mlb_data.json
+
+      - name: Show data summary
+        run: |
+          echo "=== mlb_data.json summary ==="
+          python3 -c "
+          import json, os
+          d = json.load(open('mlb_data.json'))
+          print(f'  Built:   {d[\"meta\"][\"built\"]}')
+          print(f'  Seasons: {d[\"meta\"][\"seasons\"]}')
+          print(f'  Dates:   {len(d[\"schedule\"])}')
+          print(f'  Players: {len(d[\"players\"])}')
+          print(f'  H2H:     {len(d[\"h2h\"])}')
+          print(f'  Rosters: {len(d[\"rosters\"])}')
+          size = os.path.getsize('mlb_data.json') / 1024
+          html_size = os.path.getsize('${{ steps.htmlpath.outputs.path }}') / 1024
+          print(f'  JSON:    {size:.0f} KB')
+          print(f'  HTML:    {html_size:.0f} KB')
+          "
+
+      - name: Commit and push updated HTML
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage the updated HTML (the blob is embedded inside it)
+          git add "${{ steps.htmlpath.outputs.path }}"
+
+          # Also stage mlb_data.json if you want it as a standalone artifact
+          # Comment this out if you only want the self-contained HTML
+          git add mlb_data.json
+
+          # Only commit if there are actual changes
+          if git diff --staged --quiet; then
+            echo "✅ No changes detected — data is already up to date."
+          else
+            BUILT=$(date -u +"%Y-%m-%d %H:%M UTC")
+            SEASONS="${{ steps.seasons.outputs.seasons }}"
+            git commit -m "chore: refresh MLB matchup data [${SEASONS}] — ${BUILT}
+
+          Auto-refreshed by GitHub Actions.
+          Seasons: ${SEASONS}
+          Dates in schedule: $(python3 -c \"import json; print(len(json.load(open('mlb_data.json'))['schedule']))\")"
+            git push
+            echo "✅ Pushed updated data to repo."
+          fi
+
+      - name: Summary
+        run: |
+          echo "### ⚾ MLB Data Refresh Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          python3 -c "
+          import json
+          d = json.load(open('mlb_data.json'))
+          print(f'| Field | Value |')
+          print(f'|-------|-------|')
+          print(f'| Built | {d[\"meta\"][\"built\"]} |')
+          print(f'| Seasons | {d[\"meta\"][\"seasons\"]} |')
+          print(f'| Game dates | {len(d[\"schedule\"])} |')
+          print(f'| Players tracked | {len(d[\"players\"])} |')
+          print(f'| H2H matchup records | {len(d[\"h2h\"])} |')
+          " >> $GITHUB_STEP_SUMMARY

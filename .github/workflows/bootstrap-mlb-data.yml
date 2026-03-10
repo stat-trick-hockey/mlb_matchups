@@ -1,0 +1,104 @@
+name: Bootstrap MLB Data (First Run)
+
+on:
+  # Manual trigger only — run this once to seed the data blob
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: 'Seasons to fetch (space-separated)'
+        required: false
+        default: '2023 2024 2025'
+      html_path:
+        description: 'Path to HTML file'
+        required: false
+        default: 'index.html'
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    # Give it plenty of time — 3 seasons of data takes 20-40 min
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Verify files exist
+        run: |
+          echo "📁 Repo contents:"
+          ls -la
+          if [ ! -f "${{ inputs.html_path }}" ]; then
+            echo "❌ ${{ inputs.html_path }} not found — make sure you committed it first."
+            exit 1
+          fi
+          if [ ! -f "fetch_mlb_data.py" ]; then
+            echo "❌ fetch_mlb_data.py not found — make sure you committed it first."
+            exit 1
+          fi
+          echo "✅ Both files present."
+
+      - name: Fetch all MLB data (this takes 20–40 minutes)
+        run: |
+          echo "🚀 Starting full data fetch for seasons: ${{ inputs.seasons }}"
+          echo "⏱  Grab a coffee — this will take a while."
+          python fetch_mlb_data.py \
+            --seasons ${{ inputs.seasons }} \
+            --inject "${{ inputs.html_path }}" \
+            --out mlb_data.json
+
+      - name: Show what was fetched
+        run: |
+          python3 -c "
+          import json, os
+          d = json.load(open('mlb_data.json'))
+          print('✅ Fetch complete!')
+          print(f'   Built:   {d[\"meta\"][\"built\"]}')
+          print(f'   Seasons: {d[\"meta\"][\"seasons\"]}')
+          print(f'   Dates:   {len(d[\"schedule\"])}')
+          print(f'   Players: {len(d[\"players\"])}')
+          print(f'   H2H:     {len(d[\"h2h\"])}')
+          print(f'   Rosters: {len(d[\"rosters\"])}')
+          json_kb  = os.path.getsize(\"mlb_data.json\") / 1024
+          html_kb  = os.path.getsize(\"${{ inputs.html_path }}\") / 1024
+          print(f'   JSON:    {json_kb:.0f} KB')
+          print(f'   HTML:    {html_kb:.0f} KB (blob injected)')
+          "
+
+      - name: Commit and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ inputs.html_path }}" mlb_data.json
+          git commit -m "bootstrap: inject MLB data blob for seasons ${{ inputs.seasons }}
+
+          Initial data load via Bootstrap workflow.
+          All subsequent refreshes handled by refresh-mlb-data.yml (weekly)."
+          git push
+          echo "✅ Pushed — your GitHub Pages site will redeploy in ~30 seconds."
+
+      - name: Done
+        run: |
+          echo "### ⚾ Bootstrap Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Your HTML now has the full data blob embedded." >> $GITHUB_STEP_SUMMARY
+          echo "The weekly **refresh-mlb-data** workflow will keep it current." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          python3 -c "
+          import json
+          d = json.load(open('mlb_data.json'))
+          print('| Field | Value |')
+          print('|-------|-------|')
+          print(f'| Built | {d[\"meta\"][\"built\"]} |')
+          print(f'| Seasons | {d[\"meta\"][\"seasons\"]} |')
+          print(f'| Game dates | {len(d[\"schedule\"])} |')
+          print(f'| Players | {len(d[\"players\"])} |')
+          print(f'| H2H records | {len(d[\"h2h\"])} |')
+          " >> $GITHUB_STEP_SUMMARY
