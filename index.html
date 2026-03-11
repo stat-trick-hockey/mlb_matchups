@@ -932,7 +932,7 @@ function renderCard(rank, batter, pitcher, game, hStat, pStat, h2h, recentH, rec
     <div class="rank-number">${rank}</div>
     <div class="card-band">
       <span class="game-label">${game.away} <span style="color:#6b8aad">@</span> ${game.home}</span>
-      <span class="score-badge">${gameTime}${parkFactor && parkFactor !== 100 ? \` \u00b7 PF ${parkFactor}\` : ''}</span>
+      <span class="score-badge">${gameTime}${parkFactor && parkFactor !== 100 ? " · PF " + parkFactor : ""}</span>
     </div>
     <div class="card-body">
       <div class="player-half batter">
