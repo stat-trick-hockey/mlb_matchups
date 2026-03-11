@@ -641,7 +641,11 @@ async function liveRoster(teamId, season) {
 
 /* ── UNIFIED DATA LAYER ─────────────────────────────── */
 async function getSchedule(dateStr) {
-  if (HAS_BLOB) return blobSchedule(dateStr);
+  if (HAS_BLOB) {
+    const games = blobSchedule(dateStr);
+    // Return blob games even if pitchers are null — loadMatchups handles that case
+    if (games && games.length > 0) return Promise.resolve(games);
+  }
   return liveSchedule(dateStr);
 }
 async function getRoster(teamId, season) {
@@ -951,7 +955,7 @@ function renderCard(rank, batter, pitcher, game, hStat, pStat, h2h, recentH, rec
       <div class="vs-divider">VS</div>
       <div class="player-half pitcher">
         <div class="player-role">Pitcher</div>
-        <div class="player-name">${pitcher.name}</div>
+        <div class="player-name">${pitcher.name || 'TBD'}</div>
         <div class="player-team">${pitcher.team}</div>
         <div class="hand-badge">${pitBio.pitchHand==='L'?'LHP':'RHP'}</div>
         <div class="stat-row">
@@ -1011,6 +1015,38 @@ async function loadMatchups() {
       const pitchers = [];
       if (g.awayPit) pitchers.push({ id: g.awayPit, name: g.awayPitN, team: g.away, battingTeamId: g.homeId, battingTeam: g.home, parkTeam: g.home });
       if (g.homePit) pitchers.push({ id: g.homePit, name: g.homePitN, team: g.home, battingTeamId: g.awayId, battingTeam: g.away, parkTeam: g.home });
+
+      // Historical date — no pitchers announced. Score all roster vs roster combos
+      // using season stats only (no pitcher-specific splits).
+      if (pitchers.length === 0 && HAS_BLOB) {
+        for (const side of [{battingTeamId: g.homeId, battingTeam: g.home, oppTeam: g.away},
+                             {battingTeamId: g.awayId, battingTeam: g.away, oppTeam: g.home}]) {
+          const roster = await getRoster(side.battingTeamId, season);
+          const parkFactor = getParkFactor(g.home);
+          for (const batter of roster.slice(0, 6)) {
+            const [hStat, batBio, recentH, platoonHit] = await Promise.all([
+              getHitStats(batter.id, season),
+              getBio(batter.id),
+              getRecentHit(batter.id, season),
+              getPlatoonHit(batter.id, season),
+            ]);
+            if (!hStat.ab || hStat.ab < 20) continue;
+            // No pitcher — score purely on batter quality + park + recent form
+            const { score } = scoreMatchup(hStat, {}, null, recentH, {}, batBio.batSide, '?',
+              platoonHit, {}, parkFactor, batter.order, hStat.kPct, hStat.bbPct);
+            allMatchups.push({
+              score,
+              batter: { ...batter, team: side.battingTeam },
+              pitcher: { id: null, name: 'TBD', team: side.oppTeam },
+              game: { away: g.away, home: g.home, time: g.time },
+              hStat, pitStat: {}, h2h: null, recentH, recentP: {},
+              batBio, pitBio: { batSide: '?', pitchHand: '?' },
+              platoonHit: platoonHit || {}, platoonPit: {}, parkFactor
+            });
+          }
+        }
+        continue; // skip pitcher loop below
+      }
 
       for (const pit of pitchers) {
         const parkFactor = getParkFactor(pit.parkTeam);
